@@ -1,21 +1,19 @@
 import sublime
 from datetime import datetime,timedelta
+from pytz import timezone
+import pytz
 from os import path
 import calendar,json
 
 import urllib.request as urllib
 from .sun import Sun
-from .timezone import FixedOffset,UTC
 
 from .package_control_download_wrapper import fetch
 
 INTERVAL = 0.3 # interval in minutes to do new cycle check
 
-TZ_URL = 'https://maps.googleapis.com/maps/api/timezone/json?location={0[latitude]},{0[longitude]}&timestamp={1}&sensor=false'
-TZ_CACHE_LIFETIME = timedelta(days=1)
-
-IP_URL = 'https://freegeoip.net/json/'
-IP_CACHE_LIFETIME = timedelta(days=1)
+IP_URL = 'http://ip-api.com/json'
+CACHE_LIFETIME = timedelta(hours=12)
 
 PACKAGE = path.splitext(path.basename(__file__))[0]
 
@@ -29,6 +27,8 @@ class Settings():
         self.sun = None
         self.coordinates = None
         self.timezone = None
+        self.timezoneName = None
+        self.fixedTimes = None
 
         self.load()
 
@@ -36,7 +36,7 @@ class Settings():
         if not self._ipcache:
             return True
 
-        return self._ipcache['date'] < (datetime - IP_CACHE_LIFETIME)
+        return self._ipcache['date'] < (datetime.now() - CACHE_LIFETIME)
 
     def _needsTzCacheRefresh(self, datetime):
         if not self._tzcache:
@@ -48,7 +48,7 @@ class Settings():
         if self._tzcache['coordinates'] != self.coordinates:
             return True
 
-        return self._tzcache['date'] < (datetime - TZ_CACHE_LIFETIME)
+        return self._tzcache['date'] < (datetime.now() - CACHE_LIFETIME)
 
     def _callJsonApi(self, url):
         try:
@@ -60,9 +60,6 @@ class Settings():
 
     def _getIPData(self):
         return self._callJsonApi(IP_URL)
-
-    def _getTimezoneData(self, timestamp):
-        return self._callJsonApi(TZ_URL.format(self.coordinates, timestamp))
 
     def getSun(self):
         if self.fixedCoordinates:
@@ -76,34 +73,43 @@ class Settings():
             if self._needsIpCacheRefresh(now):
                 result = self._getIPData()
                 self._ipcache = {'date': now}
-                if 'latitude' in result and 'longitude' in result:
-                    self.coordinates = {'latitude': result['latitude'], 'longitude': result['longitude']}
+                if 'lat' in result and 'lon' in result and 'timezone' in result:
+                    self.coordinates = {'latitude': result['lat'], 'longitude': result['lon']}
                     logToConsole('Using location [{0[latitude]}, {0[longitude]}] from IP lookup'.format(self.coordinates))
                     self.sun = Sun(self.coordinates)
+                    self.timezoneName = result['timezone']
         except TypeError:
             # Greenwich coordinates
             self.coordinates = {'latitude': 51.2838, 'longitude': 0}
             logToConsole('Using location [{0[latitude]}, {0[longitude]}] from Greenwich'.format(self.coordinates))
             self.sun = Sun(self.coordinates)
+            self.timezoneName = 'UTC'
 
         if (self.sun):
             return self.sun
         else:
             raise KeyError('SunCycle: no coordinates')
 
-    def getTimeZone(self):
+    def getTimezone(self):
         now = datetime.utcnow()
 
         if self._needsTzCacheRefresh(now):
-            result = self._getTimezoneData(calendar.timegm(now.timetuple()))
-            self._tzcache = {'date': now, 'fixedCoordinates': self.fixedCoordinates, 'coordinates': self.coordinates}
-            if result and 'timeZoneName' in result:
-                self.timezone = FixedOffset((result['rawOffset'] + result['dstOffset']) / 60, result['timeZoneName'])
+            self._tzcache = {
+                'date': now,
+                'fixedCoordinates': self.fixedCoordinates,
+                'coordinates': self.coordinates,
+                'timezoneName': self.timezoneName
+            }
+            if self.timezoneName:
+                self.timezone = timezone(self.timezoneName)
             else:
-                self.timezone = UTC()
-            logToConsole('Using {0}'.format(self.timezone.tzname()))
+                self.timezone = pytz.utc
+            logToConsole('Using {0}'.format(self.timezone.tzname(now)))
 
         return self.timezone
+
+    def getFixedTimes(self):
+        return self.fixedTimes
 
     def load(self):
         settings = self._sublimeSettings = sublime.load_settings(PACKAGE + '.sublime-settings')
@@ -129,9 +135,20 @@ class Settings():
             logToConsole('Using location [{0[latitude]}, {0[longitude]}] from settings'.format(self.coordinates))
 
         sun = self.getSun()
-        now = datetime.now(tz=self.getTimeZone())
-        logToConsole('Sunrise at {0}'.format(sun.sunrise(now)))
-        logToConsole('Sunset at {0}'.format(sun.sunset(now)))
+        now = self.getTimezone().localize(datetime.now())
+
+        fixedSunrise = settings.get('sunrise')
+        fixedSunset = settings.get('sunset')
+        if fixedSunrise and fixedSunset:
+            self.fixedTimes = {
+                'sunrise': self.getTimezone().localize(datetime.combine(datetime.now(), datetime.strptime(fixedSunrise, '%H:%M').time())),
+                'sunset': self.getTimezone().localize(datetime.combine(datetime.now(), datetime.strptime(fixedSunset, '%H:%M').time()))
+            }
+            logToConsole('Fixed sunrise at {0}'.format(self.fixedTimes['sunrise']))
+            logToConsole('Fixed sunset at {0}'.format(self.fixedTimes['sunset']))
+        else:
+            logToConsole('Sunrise at {0}'.format(sun.sunrise(now)))
+            logToConsole('Sunset at {0}'.format(sun.sunset(now)))
 
         if self.loaded and self.onChange:
             self.onChange()
@@ -149,8 +166,12 @@ class SunCycle():
 
     def getDayOrNight(self):
         sun = self.settings.getSun()
-        now = datetime.now(tz=self.settings.getTimeZone())
-        return 'day' if now >= sun.sunrise(now) and now <= sun.sunset(now) else 'night'
+        now = self.settings.getTimezone().localize(datetime.now())
+        fixedTimes = self.settings.getFixedTimes()
+        if fixedTimes:
+            return 'day' if now >= fixedTimes['sunrise'] and now <= fixedTimes['sunset'] else 'night'
+        else:
+            return 'day' if now >= sun.sunrise(now) and now <= sun.sunset(now) else 'night'
 
     def cycle(self):
         sublimeSettings = sublime.load_settings('Preferences.sublime-settings')
